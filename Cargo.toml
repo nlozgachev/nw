@@ -1,0 +1,17 @@
+[package]
+name = "nw"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nw"
+path = "src/main.rs"
+
+[dependencies]
+clap        = { version = "4.5", features = ["derive"] }
+comfy-table = "7.2"
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+thiserror   = "2.0"
+anyhow      = "1.0"
+chrono      = { version = "0.4", default-features = false, features = ["clock", "std"] }
