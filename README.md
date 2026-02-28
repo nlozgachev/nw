@@ -205,4 +205,4 @@ History ranges: `1M` (1 month), `6M` (6 months), `1Y` (1 year), `5Y` (5 years), 
 
 ## License
 
-MIT
+BSD 3-Clause License
