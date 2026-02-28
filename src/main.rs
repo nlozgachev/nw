@@ -97,7 +97,7 @@ fn handle_snapshot(args: cli::SnapshotArgs, portfolio: &mut model::Portfolio) ->
             let entries_raw = prompt::prompt_asset_values(&portfolio.assets, None)?;
             let entries = entries_raw
                 .into_iter()
-                .map(|(id, val)| model::SnapshotEntry { asset_id: id, value: val })
+                .map(|(asset_id, value)| model::SnapshotEntry { asset_id, value })
                 .collect();
             portfolio.snapshots.push(model::Snapshot {
                 date: a.date,
@@ -130,7 +130,7 @@ fn handle_snapshot(args: cli::SnapshotArgs, portfolio: &mut model::Portfolio) ->
                 prompt::prompt_asset_values(&portfolio.assets, Some(&existing_map))?;
             let entries = entries_raw
                 .into_iter()
-                .map(|(id, val)| model::SnapshotEntry { asset_id: id, value: val })
+                .map(|(asset_id, value)| model::SnapshotEntry { asset_id, value })
                 .collect();
             portfolio.snapshots[idx].rates = rates;
             portfolio.snapshots[idx].entries = entries;
@@ -165,11 +165,10 @@ fn handle_show(args: cli::ShowArgs, portfolio: &model::Portfolio) -> Result<()> 
     let (grand_total, rows) =
         compute::compute_show_rows(snapshot, portfolio, category_filter)?;
 
-    let mut category_totals = std::collections::HashMap::new();
-    for row in &rows {
-        *category_totals.entry(row.category.clone()).or_insert(0.0) += row.usd_value;
-    }
-    let allocation = compute::compute_allocation(&category_totals, grand_total);
+    let allocation = compute::compute_allocation(
+        &compute::compute_category_totals(&rows),
+        grand_total,
+    );
 
     display::print_show(rows, grand_total, allocation, &snapshot.date, category_filter);
     Ok(())
@@ -190,18 +189,16 @@ fn handle_history(args: cli::HistoryArgs, portfolio: &model::Portfolio) -> Resul
 
 fn validate_date(date: &str) -> Result<()> {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map_err(|_| error::NwError::InvalidDate(date.to_string()))?;
-    Ok(())
+        .map(|_| ())
+        .map_err(|_| error::NwError::InvalidDate(date.to_string()).into())
 }
 
 fn collect_non_usd_currencies(portfolio: &model::Portfolio) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut currencies = Vec::new();
-    for asset in &portfolio.assets {
-        if asset.currency != "USD" && seen.insert(asset.currency.clone()) {
-            currencies.push(asset.currency.clone());
-        }
-    }
-    currencies.sort();
-    currencies
+    portfolio.assets
+        .iter()
+        .filter(|a| a.currency != "USD")
+        .map(|a| a.currency.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }

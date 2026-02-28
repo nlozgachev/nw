@@ -24,15 +24,14 @@ fn fmt_currency(value: f64) -> String {
 
 fn fmt_with_commas(n: u64) -> String {
     let s = n.to_string();
-    let chars: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-    for (i, c) in chars.iter().enumerate() {
-        if i > 0 && (chars.len() - i).is_multiple_of(3) {
-            result.push(',');
-        }
-        result.push(*c);
-    }
-    result
+    let len = s.len();
+    s.chars()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let comma = (i > 0 && (len - i).is_multiple_of(3)).then_some(',');
+            comma.into_iter().chain(std::iter::once(c))
+        })
+        .collect()
 }
 
 fn fmt_change(value: f64) -> String {

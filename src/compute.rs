@@ -26,33 +26,21 @@ pub fn compute_show_rows(
     let asset_map: HashMap<&str, &crate::model::Asset> =
         portfolio.assets.iter().map(|a| (a.id.as_str(), a)).collect();
 
-    let mut rows = Vec::new();
-    let mut grand_total = 0.0;
-
-    for entry in &snapshot.entries {
-        let asset = match asset_map.get(entry.asset_id.as_str()) {
-            Some(a) => a,
-            None => continue, // silently skip removed assets
-        };
-
-        if let Some(filter) = category_filter {
-            if asset.category != filter {
-                continue;
-            }
-        }
-
-        let usd_value = to_usd(entry.value, &asset.currency, &snapshot.rates)?;
-        grand_total += usd_value;
-        rows.push(ShowRow {
-            asset_name: asset.name.clone(),
-            currency: asset.currency.clone(),
-            native_value: entry.value,
-            usd_value,
-            category: asset.category.clone(),
-        });
-    }
-
-    Ok((grand_total, rows))
+    snapshot.entries
+        .iter()
+        .filter_map(|entry| asset_map.get(entry.asset_id.as_str()).map(|a| (entry, *a)))
+        .filter(|(_, asset)| category_filter.is_none_or(|f| asset.category == f))
+        .try_fold((0.0_f64, Vec::new()), |(total, mut rows), (entry, asset)| {
+            let usd_value = to_usd(entry.value, &asset.currency, &snapshot.rates)?;
+            rows.push(ShowRow {
+                asset_name: asset.name.clone(),
+                currency: asset.currency.clone(),
+                native_value: entry.value,
+                usd_value,
+                category: asset.category.clone(),
+            });
+            Ok((total + usd_value, rows))
+        })
 }
 
 /// Compute allocation percentages. Returns Vec<(category, pct)> sorted by pct descending.
@@ -71,34 +59,38 @@ pub fn compute_allocation(
     result
 }
 
+/// Compute per-category USD totals from a slice of ShowRows.
+pub fn compute_category_totals(rows: &[ShowRow]) -> HashMap<String, f64> {
+    rows.iter().fold(HashMap::new(), |mut map, row| {
+        *map.entry(row.category.clone()).or_insert(0.0) += row.usd_value;
+        map
+    })
+}
+
 /// Filter snapshots to those within the given range, anchored at `today` (YYYY-MM-DD).
 pub fn filter_by_range<'a>(
     snapshots: &'a [Snapshot],
     range: HistoryRange,
     today: &str,
 ) -> Vec<&'a Snapshot> {
-    if range == HistoryRange::All {
-        return snapshots.iter().collect();
-    }
-
-    let today_date = match NaiveDate::parse_from_str(today, "%Y-%m-%d") {
-        Ok(d) => d,
-        Err(_) => return snapshots.iter().collect(),
+    let cutoff_str: Option<String> = if range == HistoryRange::All {
+        None
+    } else {
+        NaiveDate::parse_from_str(today, "%Y-%m-%d").ok().map(|d| {
+            let cutoff = match range {
+                HistoryRange::OneMonth  => subtract_months(d, 1),
+                HistoryRange::SixMonths => subtract_months(d, 6),
+                HistoryRange::OneYear   => subtract_years(d, 1),
+                HistoryRange::FiveYears => subtract_years(d, 5),
+                HistoryRange::All       => unreachable!(),
+            };
+            cutoff.format("%Y-%m-%d").to_string()
+        })
     };
-
-    let cutoff = match range {
-        HistoryRange::OneMonth => subtract_months(today_date, 1),
-        HistoryRange::SixMonths => subtract_months(today_date, 6),
-        HistoryRange::OneYear => subtract_years(today_date, 1),
-        HistoryRange::FiveYears => subtract_years(today_date, 5),
-        HistoryRange::All => unreachable!(),
-    };
-
-    let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
 
     snapshots
         .iter()
-        .filter(|s| s.date.as_str() >= cutoff_str.as_str())
+        .filter(|s| cutoff_str.as_deref().is_none_or(|c| s.date.as_str() >= c))
         .collect()
 }
 
@@ -147,28 +139,24 @@ pub fn compute_history_rows(
     snapshots: &[&Snapshot],
     portfolio: &Portfolio,
 ) -> Result<Vec<HistoryRow>, NwError> {
-    let mut rows = Vec::new();
-    let mut prev_total: Option<f64> = None;
+    let totals: Vec<(String, f64)> = snapshots
+        .iter()
+        .map(|s| snapshot_total_usd(s, portfolio).map(|t| (s.date.clone(), t)))
+        .collect::<Result<_, _>>()?;
 
-    for snapshot in snapshots {
-        let total_usd = snapshot_total_usd(snapshot, portfolio)?;
-        let (change_usd, change_pct) = match prev_total {
-            Some(prev) => {
-                let (cu, cp) = compute_change(prev, total_usd);
+    Ok(totals
+        .iter()
+        .enumerate()
+        .map(|(i, (date, total_usd))| {
+            let (change_usd, change_pct) = if i == 0 {
+                (None, None)
+            } else {
+                let (cu, cp) = compute_change(totals[i - 1].1, *total_usd);
                 (Some(cu), Some(cp))
-            }
-            None => (None, None),
-        };
-        rows.push(HistoryRow {
-            date: snapshot.date.clone(),
-            total_usd,
-            change_usd,
-            change_pct,
-        });
-        prev_total = Some(total_usd);
-    }
-
-    Ok(rows)
+            };
+            HistoryRow { date: date.clone(), total_usd: *total_usd, change_usd, change_pct }
+        })
+        .collect())
 }
 
 /// Returns (change_usd, change_pct). If prev == 0, change_pct is 0.0.
