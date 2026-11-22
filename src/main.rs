@@ -1,204 +1,36 @@
-mod cli;
-mod compute;
-mod display;
-mod error;
-mod model;
-mod prompt;
-mod store;
-
-use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Command, AssetSubcommand, SnapshotSubcommand};
-use model::HistoryRange;
-use std::str::FromStr;
+use nw::cli::Cli;
+use nw::error::NwError;
+use std::io::{self, IsTerminal, Write};
+use std::process::ExitCode;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut portfolio = store::load_portfolio()?;
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = io::stdout();
+    let stdout_is_tty = stdout.is_terminal();
+    let mut stdout_lock = stdout.lock();
+    let stderr = io::stderr();
+    let mut stderr_lock = stderr.lock();
+    let today = chrono::Local::now().date_naive();
 
-    match cli.command {
-        Command::Asset(args) => handle_asset(args, &mut portfolio)?,
-        Command::Snapshot(args) => handle_snapshot(args, &mut portfolio)?,
-        Command::Show(args) => handle_show(args, &portfolio)?,
-        Command::History(args) => handle_history(args, &portfolio)?,
-    }
-
-    Ok(())
-}
-
-fn handle_asset(args: cli::AssetArgs, portfolio: &mut model::Portfolio) -> Result<()> {
-    match args.subcommand {
-        AssetSubcommand::Add(a) => {
-            let currency = a.currency.to_uppercase();
-            if portfolio.assets.iter().any(|x| x.id == a.id) {
-                return Err(error::NwError::DuplicateAssetId(a.id).into());
-            }
-            portfolio.assets.push(model::Asset {
-                id: a.id,
-                name: a.name,
-                category: a.category.to_lowercase(),
-                currency,
-            });
-            store::save_portfolio(portfolio)?;
-            println!("Asset added.");
+    match nw::run_with_io(
+        cli,
+        &mut reader,
+        &mut stdout_lock,
+        &mut stderr_lock,
+        today,
+        stdout_is_tty,
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(NwError::Aborted) => {
+            let _ = writeln!(stderr_lock, "Aborted.");
+            ExitCode::from(130)
         }
-        AssetSubcommand::Edit(a) => {
-            let asset = portfolio
-                .assets
-                .iter_mut()
-                .find(|x| x.id == a.id)
-                .ok_or_else(|| error::NwError::AssetNotFound(a.id.clone()))?;
-            let mut changed = false;
-            if let Some(name) = a.name { asset.name = name; changed = true; }
-            if let Some(cat) = a.category { asset.category = cat.to_lowercase(); changed = true; }
-            if let Some(cur) = a.currency { asset.currency = cur.to_uppercase(); changed = true; }
-            if changed {
-                store::save_portfolio(portfolio)?;
-                println!("Asset updated.");
-            } else {
-                println!("Nothing to update.");
-            }
-        }
-        AssetSubcommand::Remove(a) => {
-            if !portfolio.assets.iter().any(|x| x.id == a.id) {
-                return Err(error::NwError::AssetNotFound(a.id).into());
-            }
-            let count = portfolio
-                .snapshots
-                .iter()
-                .filter(|s| s.entries.iter().any(|e| e.asset_id == a.id))
-                .count();
-            if !prompt::confirm(&format!(
-                "This asset appears in {count} snapshot(s). Are you sure? (y/N)"
-            )) {
-                println!("Aborted.");
-                return Ok(());
-            }
-            portfolio.assets.retain(|x| x.id != a.id);
-            store::save_portfolio(portfolio)?;
-            println!("Asset removed.");
-        }
-        AssetSubcommand::List => {
-            display::print_asset_list(&portfolio.assets);
+        Err(err) => {
+            let _ = writeln!(stderr_lock, "error: {err}");
+            ExitCode::FAILURE
         }
     }
-    Ok(())
-}
-
-fn handle_snapshot(args: cli::SnapshotArgs, portfolio: &mut model::Portfolio) -> Result<()> {
-    match args.subcommand {
-        SnapshotSubcommand::Add(a) => {
-            validate_date(&a.date)?;
-            if portfolio.snapshots.iter().any(|s| s.date == a.date) {
-                return Err(error::NwError::SnapshotAlreadyExists(a.date).into());
-            }
-            let currencies = collect_non_usd_currencies(portfolio);
-            let rates = prompt::prompt_rates(&currencies, None)?;
-            let entries_raw = prompt::prompt_asset_values(&portfolio.assets, None)?;
-            let entries = entries_raw
-                .into_iter()
-                .map(|(asset_id, value)| model::SnapshotEntry { asset_id, value })
-                .collect();
-            portfolio.snapshots.push(model::Snapshot {
-                date: a.date,
-                rates,
-                entries,
-            });
-            store::save_portfolio(portfolio)?;
-            println!("Snapshot saved.");
-        }
-        SnapshotSubcommand::Edit(a) => {
-            validate_date(&a.date)?;
-            let idx = portfolio
-                .snapshots
-                .iter()
-                .position(|s| s.date == a.date)
-                .ok_or_else(|| error::NwError::SnapshotNotFound(a.date.clone()))?;
-            if !prompt::confirm(&format!("Overwrite snapshot for {}? (y/N)", a.date)) {
-                println!("Aborted.");
-                return Ok(());
-            }
-            let existing = portfolio.snapshots[idx].clone();
-            let currencies = collect_non_usd_currencies(portfolio);
-            let rates = prompt::prompt_rates(&currencies, Some(&existing.rates))?;
-            let existing_map: std::collections::HashMap<String, f64> = existing
-                .entries
-                .iter()
-                .map(|e| (e.asset_id.clone(), e.value))
-                .collect();
-            let entries_raw =
-                prompt::prompt_asset_values(&portfolio.assets, Some(&existing_map))?;
-            let entries = entries_raw
-                .into_iter()
-                .map(|(asset_id, value)| model::SnapshotEntry { asset_id, value })
-                .collect();
-            portfolio.snapshots[idx].rates = rates;
-            portfolio.snapshots[idx].entries = entries;
-            store::save_portfolio(portfolio)?;
-            println!("Snapshot updated.");
-        }
-        SnapshotSubcommand::List => {
-            display::print_snapshot_list(&portfolio.snapshots);
-        }
-    }
-    Ok(())
-}
-
-fn handle_show(args: cli::ShowArgs, portfolio: &model::Portfolio) -> Result<()> {
-    if portfolio.snapshots.is_empty() {
-        println!("No snapshots yet.");
-        return Ok(());
-    }
-
-    let snapshot = if let Some(date) = &args.date {
-        validate_date(date)?;
-        portfolio
-            .snapshots
-            .iter()
-            .find(|s| &s.date == date)
-            .ok_or_else(|| error::NwError::SnapshotNotFound(date.clone()))?
-    } else {
-        portfolio.snapshots.last().expect("non-empty checked above")
-    };
-
-    let category_filter = args.category.as_deref();
-    let (grand_total, rows) =
-        compute::compute_show_rows(snapshot, portfolio, category_filter)?;
-
-    let allocation = compute::compute_allocation(
-        &compute::compute_category_totals(&rows),
-        grand_total,
-    );
-
-    display::print_show(rows, grand_total, allocation, &snapshot.date, category_filter);
-    Ok(())
-}
-
-fn handle_history(args: cli::HistoryArgs, portfolio: &model::Portfolio) -> Result<()> {
-    let range = HistoryRange::from_str(&args.range)?;
-    let today = chrono::Local::now().date_naive().to_string();
-    let filtered = compute::filter_by_range(&portfolio.snapshots, range, &today);
-    if filtered.is_empty() {
-        println!("No snapshots in range.");
-        return Ok(());
-    }
-    let history_rows = compute::compute_history_rows(&filtered, portfolio)?;
-    display::print_history(history_rows, &range.to_string());
-    Ok(())
-}
-
-fn validate_date(date: &str) -> Result<()> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .map(|_| ())
-        .map_err(|_| error::NwError::InvalidDate(date.to_string()).into())
-}
-
-fn collect_non_usd_currencies(portfolio: &model::Portfolio) -> Vec<String> {
-    portfolio.assets
-        .iter()
-        .filter(|a| a.currency != "USD")
-        .map(|a| a.currency.clone())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect()
 }

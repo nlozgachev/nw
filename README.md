@@ -21,50 +21,56 @@ This tool does none of that. It is a plain ledger: you enter numbers, it stores 
 cargo install --path .
 ```
 
-Requires [Rust](https://rustup.rs) stable. The binary is named `nw`.
+Requires [Rust](https://rustup.rs) 1.100+ (Edition 2024). The binary is named `nw`.
 
 ## Storage
 
-All data lives in `~/.config/nw-tracker/portfolio.json` (respects `$XDG_CONFIG_HOME`).
-The file is never modified in place — writes go to a `.json.tmp` sibling that is atomically renamed into place.
+All data lives in `~/.config/nw-tracker/portfolio.json` (respects `$XDG_CONFIG_HOME`), and can be overridden per invocation with `--file <PATH>` (`-f`) or the `NW_FILE` environment variable.
+The file is never modified in place — writes go to a secure temporary sibling file (`0600` on Unix), are synced to disk, and atomically replace the target. Keys are sorted deterministically (`BTreeMap`) and end with a trailing newline for clean git diffs.
 
 **Recommended backup strategy:** keep `portfolio.json` in a private git repository.
 
 ## Concepts
 
-**Asset** — a thing you own with a stable identity: a brokerage account, a savings account, a crypto wallet, a real-estate position, etc. Each asset has an ID, a display name, a category (free-form string), and a currency.
+**Asset** — a thing you own with a stable identity: a brokerage account, a savings account, a crypto wallet, a real-estate position, etc. Each asset has an ID, a display name, a category (free-form string), a currency, and an optional `archived` flag.
 
 **Snapshot** — a dated record of asset values. You add one whenever you want to capture a moment. Each snapshot stores:
-- exchange rates for every non-USD currency in your asset list (as "1 USD = N foreign units")
-- a value for each asset you want to include (assets can be omitted if the value is unknown)
+- exchange rates for every non-USD currency in your active asset list (as `"1 USD = N foreign units"`)
+- a non-negative value for each asset you want to include (assets can be omitted if unknown)
 
-**Category** — a free-form grouping string (e.g. `etf`, `crypto`, `bank`, `cash`, `real-estate`). No fixed list.
+**Category** — a free-form grouping string (e.g. `etf`, `crypto`, `bank`, `cash`, `real-estate`). Stored lowercase and matched case-insensitively.
 
 ## Commands
+
+Global flags: `-f, --file <PATH>` (`NW_FILE`), `--no-color`, `-V, --version`.
 
 ### Asset management
 
 ```sh
 # Add a new asset
-nw asset add --id <id> --name <name> --category <category> --currency <currency>
+nw asset add -i <id> -n <name> -c <category> --currency <currency>
 
-# Edit an existing asset (all flags optional)
-nw asset edit --id <id> [--name <name>] [--category <category>] [--currency <currency>]
+# Edit an existing asset (pass --force if changing currency on an asset with history)
+nw asset edit -i <id> [-n <name>] [-c <category>] [--currency <currency> [--force]]
 
-# Remove an asset (prompts for confirmation if it appears in snapshots)
-nw asset remove --id <id>
+# Archive / unarchive a closed account without erasing historical net worth
+nw asset archive -i <id>
+nw asset unarchive -i <id>
 
-# List all assets
-nw asset list
+# Remove an asset (prompts if referenced in snapshots; --purge deletes historical entries)
+nw asset remove -i <id> [--purge] [-y|--yes]
+
+# List active assets (or --all to include archived; --format table|json|csv)
+nw asset list [-a|--all] [--format <table|json|csv>]
 ```
 
 **Examples:**
 ```sh
-nw asset add --id vti-brokerage  --name "VTI"             --category etf  --currency USD
-nw asset add --id savings-chf    --name "Savings Account" --category bank --currency CHF
-nw asset add --id eur-cash       --name "EUR Cash"        --category cash --currency EUR
-nw asset edit --id vti-brokerage --name "VTI (Brokerage)"
-nw asset remove --id eur-cash
+nw asset add -i vti-brokerage -n "VTI"             -c etf  --currency USD
+nw asset add -i savings-chf   -n "Savings Account" -c bank --currency CHF
+nw asset add -i eur-cash      -n "EUR Cash"        -c cash --currency EUR
+nw asset edit -i vti-brokerage -n "VTI (Brokerage)"
+nw asset archive -i eur-cash
 ```
 
 ---
@@ -72,50 +78,44 @@ nw asset remove --id eur-cash
 ### Snapshot management
 
 ```sh
-# Record a new snapshot for a date (interactive prompts follow)
-nw snapshot add --date <YYYY-MM-DD>
+# Record a new snapshot (defaults to today; --carry-forward lets Enter reuse previous values)
+nw snapshot add [-d <YYYY-MM-DD>] [--carry-forward]
 
-# Edit an existing snapshot (prompts pre-filled with existing values)
-nw snapshot edit --date <YYYY-MM-DD>
+# Edit an existing snapshot (Enter keeps value, '-' clears; previews diff before saving)
+nw snapshot edit -d <YYYY-MM-DD> [-y|--yes]
+
+# Remove an existing snapshot
+nw snapshot remove -d <YYYY-MM-DD> [-y|--yes]
 
 # List all snapshots
-nw snapshot list
+nw snapshot list [--format <table|json|csv>]
 ```
 
-`snapshot add` and `snapshot edit` are interactive:
-1. For each non-USD currency in your asset list, enter the exchange rate as "1 USD = N units" (e.g. for EUR: if 1 USD buys 0.92 EUR, enter `0.92`)
-2. For each asset, enter its current value in its native currency — press Enter to omit
+`snapshot add` and `snapshot edit` are interactive (comma/underscore inputs like `12,500.50` are accepted, and `Ctrl-D` aborts without saving):
+1. For each non-USD currency in your active asset list, enter the exchange rate as `"1 USD = N units"` (e.g. for EUR: if 1 USD buys 0.92 EUR, enter `0.92`)
+2. For each active asset, enter its current value in its native currency — press Enter to omit (or keep existing/previous), or `-` to clear
 
 Snapshots are always stored in ascending date order regardless of insertion order, so backfilling old dates is safe.
 
-**Example:**
-```sh
-nw snapshot add --date 2025-06-01
-# --- Exchange Rates ---
-# CHF rate (1 USD = ? CHF): 0.90
-# EUR rate (1 USD = ? EUR): 0.92
-# --- Asset Values (press Enter to omit) ---
-# VTI (ETF, USD): 12500
-# Savings Account (BANK, CHF): 9000
-# EUR Cash (CASH, EUR): 800
-```
-
 ---
 
-### Display
+### Display & Utilities
 
 ```sh
-# Show latest snapshot
-nw show
+# Show latest snapshot (or a specific date, category filter, or json/csv format)
+nw show [-d <YYYY-MM-DD>] [-c <category>] [--format <table|json|csv>]
 
-# Show a specific past snapshot
-nw show --date <YYYY-MM-DD>
+# Show net worth history (range defaults to 1Y)
+nw history [-r <1M|6M|1Y|5Y|ALL>] [-c <category>] [--format <table|json|csv>]
 
-# Filter display to a single category
-nw show --category <category>
+# Print the active portfolio file path
+nw path
 
-# Show net worth history over a time range
-nw history --range <1M|6M|1Y|5Y|ALL>
+# Validate portfolio.json and show summary counts
+nw validate
+
+# Generate shell completions
+nw completions <bash|elvish|fish|powershell|zsh>
 ```
 
 **`nw show` output:**
@@ -135,7 +135,7 @@ CASH
   EUR Cash     EUR                800.00       869.57
   Subtotal                                   869.57
 
-TOTAL  23,369.57
+TOTAL  23,369.57  (+1,200.00, +5.41% vs 2025-05-01)
 
 ALLOCATION
   ETF           53.5%
@@ -153,9 +153,11 @@ Date         Total (USD)   Change (USD)   Change %
 2024-12-01    43,800.00    -1,300.00      -2.88%
 2025-03-01    48,200.00    +4,400.00      +10.05%
 2025-06-01    51,400.00    +3,200.00      +6.64%
+
+Period change (2024-06-01 -> 2025-06-01): +9,100.00 (+21.51%)
 ```
 
-History ranges: `1M` (1 month), `6M` (6 months), `1Y` (1 year), `5Y` (5 years), `ALL`.
+History ranges: `1M` (1 month), `6M` (6 months), `1Y` (1 year, default), `5Y` (5 years), `ALL`.
 
 ---
 
@@ -165,6 +167,7 @@ History ranges: `1M` (1 month), `6M` (6 months), `1Y` (1 year), `5Y` (5 years), 
 
 ```json
 {
+  "version": 1,
   "assets": [
     {
       "id": "vti-brokerage",
@@ -196,12 +199,12 @@ History ranges: `1M` (1 month), `6M` (6 months), `1Y` (1 year), `5Y` (5 years), 
 ```
 
 **Rules:**
-- `rates` stores non-USD currencies only, as "1 USD = N foreign units". USD is always 1.0 by definition.
-- `rates` only contains currencies that appear in the asset list.
+- `version` is schema version `1` (optional on load, added on save).
+- `rates` stores non-USD currencies only, as `"1 USD = N foreign units"`. USD is always `1` by definition.
 - `entries` may omit assets — partial snapshots are valid.
-- `value` is always in the asset's native currency. Conversion to USD happens at display time.
-- `category` is lowercase; `currency` is uppercase ISO 4217 code.
-- Snapshots are always sorted ascending by date.
+- `value` is exact decimal in the asset's native currency. Conversion to USD happens at display time.
+- `category` is lowercase; `currency` is uppercase alphanumeric code (e.g. `USD`, `EUR`).
+- Snapshots are always sorted ascending by `YYYY-MM-DD` date.
 
 ## License
 
